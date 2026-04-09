@@ -30,15 +30,24 @@ print_error() {
     echo -e "${RED}  ❌ $1${NC}"
 }
 
-# --- Check if running as root or with sudo ---
-if [ "$EUID" -ne 0 ]; then
-    print_error "Please run this script with root privileges (sudo ./setup.sh)"
-    exit 1
-fi
-
-# Get the actual user (even when running with sudo)
+# --- Detect current user and privilege escalation ---
 ACTUAL_USER="${SUDO_USER:-$USER}"
 ACTUAL_HOME=$(eval echo "~${ACTUAL_USER}")
+CURRENT_USER=$(id -un)
+
+run_as_user() {
+    if [ "$CURRENT_USER" = "$ACTUAL_USER" ]; then
+        "$@"
+    else
+        sudo -u "$ACTUAL_USER" "$@"
+    fi
+}
+
+# If the script is run as root, ensure sudo is available for user-scoped actions.
+if [ "$CURRENT_USER" = "root" ] && ! command -v sudo &> /dev/null; then
+    print_error "sudo is required when running this script as root. Install sudo or run the script as a normal user."
+    exit 1
+fi
 
 # ============================================
 # Install Docker
@@ -54,14 +63,13 @@ else
     rm -f get-docker.sh
 
     # Add user to docker group (so user can run docker without sudo)
-    usermod -aG docker "$ACTUAL_USER"
+    sudo usermod -aG docker "$ACTUAL_USER"
+    newgrp docker
     print_step "User '$ACTUAL_USER' added to docker group"
-fi
 
-# Enable and start Docker service
-systemctl enable docker
-systemctl start docker
-print_step "Docker service enabled and started"
+    sudo systemctl enable docker
+    sudo systemctl start docker
+fi
 
 
 # ============================================
@@ -73,7 +81,7 @@ if command -v zsh &> /dev/null; then
     print_warn "Zsh is already installed. Skipping."
     zsh --version
 else
-    apt install -y zsh
+    sudo apt install -y zsh
     print_step "Zsh installation complete"
 fi
 
@@ -88,7 +96,7 @@ if command -v lf &> /dev/null; then
     lf -version
 else
     # Install lf from apt
-    apt install -y lf
+    sudo apt install -y lf
     print_step "LF installed via apt"
 fi
 
@@ -101,7 +109,7 @@ print_step "Installing Build Essential"
 if dpkg -l | grep -q build-essential; then
     print_warn "Build Essential is already installed. Skipping."
 else
-    apt install -y build-essential
+    sudo apt install -y build-essential
     print_step "Build Essential installation complete"
 fi
 
@@ -116,8 +124,8 @@ if command -v eza &> /dev/null; then
     eza --version
 else
     # Install GPG if not present
-    apt update
-    apt install -y gpg
+    sudo apt update
+    sudo apt install -y gpg
 
     # Add eza repository
     sudo mkdir -p /etc/apt/keyrings
@@ -126,8 +134,8 @@ else
     sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
 
     # Install eza
-    apt update
-    apt install -y eza
+    sudo apt update
+    sudo apt install -y eza
     print_step "Eza installation complete"
 fi
 
@@ -145,7 +153,7 @@ else
     LAZYGIT_ARCH=$(uname -m | sed -e 's/aarch64/arm64/')
     curl -Lo lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_${LAZYGIT_ARCH}.tar.gz"
     tar xf lazygit.tar.gz lazygit
-    install lazygit -D -t /usr/local/bin/
+    sudo install lazygit -D -t /usr/local/bin/
     rm -f lazygit.tar.gz
     print_step "Lazygit installation complete"
 fi
@@ -160,7 +168,25 @@ if command -v lazydocker &> /dev/null; then
     print_warn "Lazydocker is already installed. Skipping."
     lazydocker --version
 else
-    curl https://raw.githubusercontent.com/jesseduffield/lazydocker/master/scripts/install_update_linux.sh | bash
+    # map different architecture variations to the available binaries
+    ARCH=$(uname -m)
+    case $ARCH in
+        i386|i686) ARCH=x86 ;;
+        armv6*) ARCH=armv6 ;;
+        armv7*) ARCH=armv7 ;;
+        aarch64*) ARCH=arm64 ;;
+    esac
+
+    # prepare the download URL
+    GITHUB_LATEST_VERSION=$(curl -L -s -H 'Accept: application/json' https://github.com/jesseduffield/lazydocker/releases/latest | sed -e 's/.*"tag_name":"\([^"]*\)".*/\1/')
+    GITHUB_FILE="lazydocker_${GITHUB_LATEST_VERSION//v/}_$(uname -s)_${ARCH}.tar.gz"
+    GITHUB_URL="https://github.com/jesseduffield/lazydocker/releases/download/${GITHUB_LATEST_VERSION}/${GITHUB_FILE}"
+
+    # install/update the local binary
+    curl -L -o lazydocker.tar.gz $GITHUB_URL
+    tar xzvf lazydocker.tar.gz lazydocker
+    sudo install -Dm 755 lazydocker -t /usr/local/bin/
+    rm lazydocker lazydocker.tar.gz
     print_step "Lazydocker installation complete"
 fi
 
@@ -176,14 +202,10 @@ if command -v nvim &> /dev/null; then
 else
     # Download Neovim AppImage
     curl -LO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage
-    chmod u+x nvim-linux-x86_64.appimage
+    chmod +x nvim-linux-x86_64.appimage
 
-    # Create directory and move AppImage
-    mkdir -p /opt/nvim
-    mv nvim-linux-x86_64.appimage /opt/nvim/nvim
-
-    # Add to PATH in .zshrc
-    echo 'export PATH="$PATH:/opt/nvim/"' >> "${ACTUAL_HOME}/.zshrc"
+    sudo mv nvim-linux-x86_64.appimage /usr/local/bin/nvim
+    sudo chown root:root /usr/local/bin/nvim
 
     print_step "Neovim installation complete"
 fi
@@ -198,7 +220,7 @@ if [ -d "${ACTUAL_HOME}/.config/nvim" ]; then
     print_warn "Neovim config directory already exists. Skipping LazyVim setup."
 else
     # Clone LazyVim starter configuration
-    sudo -u "$ACTUAL_USER" git clone https://github.com/LazyVim/starter "${ACTUAL_HOME}/.config/nvim"
+    run_as_user git clone https://github.com/LazyVim/starter "${ACTUAL_HOME}/.config/nvim"
     # Remove .git to make it a personal config
     rm -rf "${ACTUAL_HOME}/.config/nvim/.git"
     print_step "LazyVim starter configuration installed"
@@ -214,8 +236,7 @@ if [ -d "${ACTUAL_HOME}/.oh-my-zsh" ]; then
     print_warn "Oh My Zsh is already installed. Skipping."
 else
     # Install Oh My Zsh in unattended mode (no shell change yet)
-    sudo -u "$ACTUAL_USER" sh -c \
-        'export RUNZSH=no; export CHSH=no; curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh | sh'
+    run_as_user sh -c 'export RUNZSH=no; export CHSH=no; curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh | sh'
     print_step "Oh My Zsh installation complete"
 fi
 
@@ -229,21 +250,21 @@ ZSH_CUSTOM="${ACTUAL_HOME}/.oh-my-zsh/custom"
 
 # zsh-autosuggestions
 if [ ! -d "${ZSH_CUSTOM}/plugins/zsh-autosuggestions" ]; then
-    sudo -u "$ACTUAL_USER" git clone https://github.com/zsh-users/zsh-autosuggestions \
+    run_as_user git clone https://github.com/zsh-users/zsh-autosuggestions \
         "${ZSH_CUSTOM}/plugins/zsh-autosuggestions"
     echo "  ✔ zsh-autosuggestions installed"
 fi
 
 # zsh-syntax-highlighting
 if [ ! -d "${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting" ]; then
-    sudo -u "$ACTUAL_USER" git clone https://github.com/zsh-users/zsh-syntax-highlighting \
+    run_as_user git clone https://github.com/zsh-users/zsh-syntax-highlighting \
         "${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting"
     echo "  ✔ zsh-syntax-highlighting installed"
 fi
 
 # powerlevel10k theme
 if [ ! -d "${ZSH_CUSTOM}/themes/powerlevel10k" ]; then
-    sudo -u "$ACTUAL_USER" git clone --depth=1 https://github.com/romkatv/powerlevel10k.git \
+    run_as_user git clone --depth=1 https://github.com/romkatv/powerlevel10k.git \
         "${ZSH_CUSTOM}/themes/powerlevel10k"
     echo "  ✔ powerlevel10k theme installed"
 fi
